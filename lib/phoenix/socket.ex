@@ -333,6 +333,7 @@ defmodule Phoenix.Socket do
   ## Options
 
     * `:assigns` - the map of socket assigns to merge into the socket on join
+    * `:assign_transport_subscribers` - todo
 
   ## Examples
 
@@ -381,7 +382,7 @@ defmodule Phoenix.Socket do
       for {topic_pattern, module, opts} <- channels do
         topic_pattern
         |> to_topic_match()
-        |> defchannel(module, opts)
+        |> defchannel(module, topic_pattern, opts)
       end
 
     quote do
@@ -398,9 +399,9 @@ defmodule Phoenix.Socket do
     end
   end
 
-  defp defchannel(topic_match, channel_module, opts) do
+  defp defchannel(topic_match, channel_module, topic_pattern, opts) do
     quote do
-      def __channel__(unquote(topic_match)), do: unquote({channel_module, Macro.escape(opts)})
+      def __channel__(unquote(topic_match)), do: {unquote(channel_module), unquote(topic_pattern), unquote(Macro.escape(opts))}
     end
   end
 
@@ -469,8 +470,8 @@ defmodule Phoenix.Socket do
 
   def __info__({:DOWN, ref, _, pid, reason}, {state, socket}) do
     case state.channels_inverse do
-      %{^pid => {topic, join_ref}} ->
-        state = delete_channel(state, pid, topic, ref)
+      %{^pid => {topic, topic_pattern, join_ref}} ->
+        state = delete_channel(state, pid, topic, topic_pattern, ref)
         {:push, encode_on_exit(socket, topic, join_ref, reason), {state, socket}}
 
       %{} ->
@@ -488,9 +489,9 @@ defmodule Phoenix.Socket do
 
   def __info__({:socket_close, pid, _reason}, {state, socket}) do
     case state.channels_inverse do
-      %{^pid => {topic, join_ref}} ->
-        {^pid, monitor_ref} = Map.fetch!(state.channels, topic)
-        state = delete_channel(state, pid, topic, monitor_ref)
+      %{^pid => {topic, topic_pattern, join_ref}} ->
+        {^pid, ^topic_pattern, monitor_ref} = Map.fetch!(state.channels, topic)
+        state = delete_channel(state, pid, topic, topic_pattern, monitor_ref)
         {:push, encode_close(socket, topic, join_ref), {state, socket}}
 
       %{} ->
@@ -545,7 +546,8 @@ defmodule Phoenix.Socket do
     # The information in the state is kept only inside the socket process.
     state = %{
       channels: %{},
-      channels_inverse: %{}
+      channels_inverse: %{},
+      topic_patterns: %{}
     }
 
     connect_result =
@@ -597,11 +599,12 @@ defmodule Phoenix.Socket do
 
   defp handle_in(nil, %{event: "phx_join", topic: topic, ref: ref, join_ref: join_ref} = message, state, socket) do
     case socket.handler.__channel__(topic) do
-      {channel, opts} ->
+      {channel, topic_pattern, opts} ->
+        socket = put_transport_subscribers(state, socket, topic_pattern, opts)
         case Phoenix.Channel.Server.join(socket, channel, message, opts) do
           {:ok, reply, pid} ->
             reply = %Reply{join_ref: join_ref, ref: ref, topic: topic, status: :ok, payload: reply}
-            state = put_channel(state, pid, topic, join_ref)
+            state = put_channel(state, pid, topic, topic_pattern, join_ref)
             {:reply, :ok, encode_reply(socket, reply), {state, socket}}
 
           {:error, reply} ->
@@ -614,23 +617,18 @@ defmodule Phoenix.Socket do
     end
   end
 
-  defp handle_in({pid, ref}, %{event: "phx_join", topic: topic} = message, state, socket) do
-    receive do
-      {:socket_close, ^pid, _reason} -> :ok
-    after
-      0 ->
-        Logger.debug(fn ->
-          "Duplicate channel join for topic \"#{topic}\" in #{inspect(socket.handler)}. " <>
-            "Closing existing channel for new join."
-        end)
-    end
+  defp handle_in({pid, topic_pattern, ref}, %{event: "phx_join", topic: topic} = message, state, socket) do
+    Logger.debug(fn ->
+      "Duplicate channel join for topic \"#{topic}\" in #{inspect(socket.handler)}. " <>
+        "Closing existing channel for new join."
+    end)
 
     :ok = shutdown_duplicate_channel(pid)
-    state = delete_channel(state, pid, topic, ref)
+    state = delete_channel(state, pid, topic, topic_pattern, ref)
     handle_in(nil, message, state, socket)
   end
 
-  defp handle_in({pid, _ref}, message, state, socket) do
+  defp handle_in({pid, _topic_pattern, _ref}, message, state, socket) do
     send(pid, message)
     {:ok, {state, socket}}
   end
@@ -651,26 +649,40 @@ defmodule Phoenix.Socket do
     {:reply, :error, encode_ignore(socket, message), {state, socket}}
   end
 
-  defp put_channel(state, pid, topic, join_ref) do
-    %{channels: channels, channels_inverse: channels_inverse} = state
+  defp put_channel(state, pid, topic, topic_pattern, join_ref) do
+    %{channels: channels, channels_inverse: channels_inverse, topic_patterns: patterns} = state
     monitor_ref = Process.monitor(pid)
 
     %{
       state |
-        channels: Map.put(channels, topic, {pid, monitor_ref}),
-        channels_inverse: Map.put(channels_inverse, pid, {topic, join_ref})
+        channels: Map.put(channels, topic, {pid, topic_pattern, monitor_ref}),
+        channels_inverse: Map.put(channels_inverse, pid, {topic, topic_pattern, join_ref}),
+        topic_patterns: Map.update(patterns, topic_pattern, MapSet.new([pid]), &MapSet.put(&1, pid))
     }
   end
 
-  defp delete_channel(state, pid, topic, monitor_ref) do
+  defp delete_channel(state, pid, topic, topic_pattern, monitor_ref) do
     %{channels: channels, channels_inverse: channels_inverse} = state
     Process.demonitor(monitor_ref, [:flush])
 
-    %{
+    drop_topic_pattern(%{
       state |
         channels: Map.delete(channels, topic),
-        channels_inverse: Map.delete(channels_inverse, pid)
-    }
+        channels_inverse: Map.delete(channels_inverse, pid),
+    }, topic_pattern, pid)
+  end
+
+  defp drop_topic_pattern(%{topic_patterns: patterns} = state, topic_pattern, pid) do
+    new_set =
+      state.topic_patterns
+      |> Map.fetch!(topic_pattern)
+      |> MapSet.delete(pid)
+
+    if Enum.empty?(new_set) do
+      %{state | topic_patterns: Map.delete(patterns, topic_pattern)}
+    else
+      %{state | topic_patterns: Map.put(patterns, topic_pattern, new_set)}
+    end
   end
 
   defp encode_on_exit(socket, topic, ref, _reason) do
@@ -705,5 +717,16 @@ defmodule Phoenix.Socket do
         Process.exit(pid, :kill)
         receive do: ({:DOWN, ^ref, _, _, _} -> :ok)
     end
+  end
+
+  defp put_transport_subscribers(state, %Socket{} = socket, topic_pattern, opts) do
+    case Access.fetch(opts, :assign_transport_subscribers) do
+      {:ok, assign_key} -> assign(socket, assign_key, transport_subscribers(state, topic_pattern))
+      :error -> socket
+    end
+  end
+
+  defp transport_subscribers(state, topic_pattern) do
+    get_in(state.topic_patterns, [topic_pattern]) || MapSet.new()
   end
 end

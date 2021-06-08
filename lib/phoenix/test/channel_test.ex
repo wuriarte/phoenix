@@ -376,11 +376,16 @@ defmodule Phoenix.ChannelTest do
       ref: System.unique_integer([:positive])
     }
 
-    {channel, opts} =
+    {socket, channel, opts} =
       if channel do
-        {channel, []}
+        {socket, channel, []}
       else
-        match_topic_to_channel!(socket, topic)
+        {channel, opts} = match_topic_to_channel!(socket, topic)
+        if key = opts[:assign_transport_subscribers] do
+          {Phoenix.Socket.assign(socket, key, []), channel, opts}
+        else
+          {socket, channel, opts}
+        end
       end
 
     case Server.join(socket, channel, message, opts) do
@@ -617,8 +622,8 @@ defmodule Phoenix.ChannelTest do
     end
 
     case socket.handler.__channel__(topic) do
-      {channel, opts} when is_atom(channel) -> {channel, opts}
-      _ -> raise "no channel found for topic #{inspect topic} in #{inspect socket.handler}"
+      {channel, _topic_match, opts} when is_atom(channel) -> {channel, opts}
+      nil -> raise "no channel found for topic #{inspect topic} in #{inspect socket.handler}"
     end
   end
 

@@ -29,6 +29,11 @@ defmodule Phoenix.Integration.WebSocketChannelsTest do
 
     intercept ["new_msg"]
 
+    def join("subs:" <> _, _, socket) do
+      subs = socket.assigns.subs |> Enum.to_list() |> :erlang.term_to_binary()
+      {:ok, {:binary, subs}, socket}
+    end
+
     def join(topic, message, socket) do
       Process.register(self(), String.to_atom(topic))
       send(self(), {:after_join, message})
@@ -137,6 +142,7 @@ defmodule Phoenix.Integration.WebSocketChannelsTest do
 
     channel "room:*", RoomChannel
     channel "custom:*", CustomChannel
+    channel "subs:*", RoomChannel, assign_transport_subscribers: :subs
 
     def connect(%{"reject" => "true"}, _socket) do
       :error
@@ -670,6 +676,32 @@ defmodule Phoenix.Integration.WebSocketChannelsTest do
         topic: ^topic
       }
       assert_receive %Message{event: "binary_event", join_ref: @join_ref, payload: {:binary, <<0, 1>>}}
+    end
+
+    test "assign_transport_subscribers" do
+      {:ok, sock} = WebsocketClient.start_link(self(), @vsn_path, @serializer)
+      WebsocketClient.join(sock, "subs:1", %{})
+
+      assert_receive %Message{topic: "subs:1", payload: %{"response" => {:binary, subs}}}
+      assert :erlang.binary_to_term(subs) == []
+
+      WebsocketClient.join(sock, "subs:2", %{})
+      assert_receive %Message{topic: "subs:2", payload: %{"response" => {:binary, subs}}}
+      assert [pid1] = :erlang.binary_to_term(subs)
+      assert is_pid(pid1)
+
+      WebsocketClient.join(sock, "subs:3", %{})
+      assert_receive %Message{topic: "subs:3", payload: %{"response" => {:binary, subs}}}
+      assert [_pid1, _pid2] = :erlang.binary_to_term(subs)
+
+      WebsocketClient.leave(sock, "subs:2", %{})
+      WebsocketClient.leave(sock, "subs:3", %{})
+      assert_receive %Message{event: "phx_close", payload: %{}}
+      assert_receive %Message{event: "phx_close", payload: %{}}
+
+      WebsocketClient.join(sock, "subs:4", %{})
+      assert_receive %Message{topic: "subs:4", payload: %{"response" => {:binary, subs}}}
+      assert [^pid1] = :erlang.binary_to_term(subs)
     end
   end
 end

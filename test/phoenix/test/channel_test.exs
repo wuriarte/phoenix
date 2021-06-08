@@ -62,6 +62,10 @@ defmodule Phoenix.Test.ChannelTest do
       {:ok, socket}
     end
 
+    def join("subs:" <> _, _, socket) do
+      {:ok, socket}
+    end
+
     def handle_in("broadcast", broadcast, socket) do
       broadcast_from!(socket, "broadcast", broadcast)
       {:noreply, socket}
@@ -158,6 +162,7 @@ defmodule Phoenix.Test.ChannelTest do
     use Phoenix.Socket
 
     channel "foo:*", Channel, assigns: %{user_socket_assigns: true}
+    channel "subs:*", Channel, assign_transport_subscribers: :subs
 
     def connect(params, socket) do
       if params["reject"] == true do
@@ -493,5 +498,11 @@ defmodule Phoenix.Test.ChannelTest do
   test "converts payload on join to string keyed" do
     {:ok, socket} = connect(UserSocket, %{})
     assert {:ok, _, _socket} = subscribe_and_join(socket, "foo:payload", %{string: nil})
+  end
+
+  test "assign_transport_subscribers" do
+    {:ok, socket} = connect(UserSocket, %{})
+    socket = subscribe_and_join!(socket, "subs:please")
+    assert socket.assigns == %{subs: []}
   end
 end
